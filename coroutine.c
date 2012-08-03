@@ -6,9 +6,16 @@
 #include <stddef.h>
 #include <string.h>
 #include <stdint.h>
+#include <time.h>
 
-#define STACK_SIZE (1024*1024)
-#define DEFAULT_COROUTINE 16
+#ifdef __cplusplus
+extern "C"
+{
+#endif
+
+#define STACK_SIZE (8*1024*1024)
+#define DEFAULT_COROUTINE 128
+#define MAX_COROUTINE 8192
 
 struct coroutine;
 
@@ -19,10 +26,13 @@ struct schedule {
 	int cap;
 	int running;
 	struct coroutine **co;
+    int last_co_id;
 };
 
 struct coroutine {
 	coroutine_func func;
+    coroutine_func on_delete;
+    coroutine_timeout_func on_timeout;
 	void *ud;
 	ucontext_t ctx;
 	struct schedule * sch;
@@ -30,18 +40,22 @@ struct coroutine {
 	ptrdiff_t size;
 	int status;
 	char *stack;
+    time_t create_time;
 };
 
 struct coroutine * 
-_co_new(struct schedule *S , coroutine_func func, void *ud) {
+_co_new(struct schedule *S , coroutine_func func, coroutine_func on_delete, coroutine_timeout_func on_timeout, void *ud) {
 	struct coroutine * co = malloc(sizeof(*co));
 	co->func = func;
+    co->on_delete = on_delete;
+    co->on_timeout = on_timeout;
 	co->ud = ud;
 	co->sch = S;
 	co->cap = 0;
 	co->size = 0;
 	co->status = COROUTINE_READY;
 	co->stack = NULL;
+    co->create_time = time(NULL);
 	return co;
 }
 
@@ -58,6 +72,7 @@ coroutine_open(void) {
 	S->cap = DEFAULT_COROUTINE;
 	S->running = -1;
 	S->co = malloc(sizeof(struct coroutine *) * S->cap);
+    S->last_co_id = -1;
 	memset(S->co, 0, sizeof(struct coroutine *) * S->cap);
 	return S;
 }
@@ -77,23 +92,31 @@ coroutine_close(struct schedule *S) {
 }
 
 int 
-coroutine_new(struct schedule *S, coroutine_func func, void *ud) {
-	struct coroutine *co = _co_new(S, func , ud);
+coroutine_new(struct schedule *S, coroutine_func func, coroutine_func on_delete, coroutine_timeout_func on_timeout, void *ud) {
+    if (S->nco >= S->cap && S->cap >= MAX_COROUTINE) {
+        // full
+        return -1;
+    }
+    
+	struct coroutine *co = _co_new(S, func, on_delete, on_timeout, ud);
 	if (S->nco >= S->cap) {
 		int id = S->cap;
+		S->cap *= 2;
 		S->co = realloc(S->co, S->cap * 2 * sizeof(struct coroutine *));
 		memset(S->co + S->cap , 0 , sizeof(struct coroutine *) * S->cap);
 		S->co[S->cap] = co;
 		S->cap *= 2;
 		++S->nco;
+        S->last_co_id = id;
 		return id;
 	} else {
 		int i;
 		for (i=0;i<S->cap;i++) {
-			int id = (i+S->nco) % S->cap;
+            int id = (i + 1 + S->last_co_id) % S->cap;
 			if (S->co[id] == NULL) {
 				S->co[id] = co;
 				++S->nco;
+                S->last_co_id = id;
 				return id;
 			}
 		}
@@ -107,11 +130,9 @@ mainfunc(uint32_t low32, uint32_t hi32) {
 	uintptr_t ptr = (uintptr_t)low32 | ((uintptr_t)hi32 << 32);
 	struct schedule *S = (struct schedule *)ptr;
 	int id = S->running;
-	struct coroutine *C = S->co[id];
-	C->func(S,C->ud);
-	_co_delete(C);
-	S->co[id] = NULL;
-	--S->nco;
+    struct coroutine *C = S->co[id];
+    C->func(S,C->ud);
+    coroutine_delete(S, id);
 	S->running = -1;
 }
 
@@ -185,3 +206,56 @@ coroutine_running(struct schedule * S) {
 	return S->running;
 }
 
+int coroutine_delete( struct schedule * S, int id ) {
+    assert(id>=0 && id < S->cap);
+    struct coroutine *C = S->co[id];
+    if (NULL == C) {
+        return -1;
+    }
+    
+    C->on_delete(S, C->ud);
+    _co_delete(C);
+    S->co[id] = NULL;
+    --S->nco;
+    return 0;
+}
+
+int coroutine_check_timeout( struct schedule * S, int life ) {
+    int del_num = 0;
+    time_t now = time(NULL);
+    int i;
+    for (i = 0; i < S->cap; ++i) {
+        struct coroutine * C = S->co[i];
+        if (NULL == C) {
+            continue;
+        }
+        
+        if (now - C->create_time >= life) {
+            C->on_timeout(S, i, C->ud);
+            coroutine_delete(S, i);
+            ++del_num;
+        }
+    }
+
+    return del_num;
+    
+}
+
+int coroutine_id( struct schedule * S )
+{
+    return S->running;
+}
+
+void* coroutine_get_ud( struct schedule * S, int id ) {
+    assert(id>=0 && id < S->cap);
+    struct coroutine *C = S->co[id];
+    if (NULL == C) {
+        return NULL;
+    }
+
+    return C->ud;
+}
+
+#ifdef __cplusplus
+}
+#endif
