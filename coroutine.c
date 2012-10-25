@@ -20,20 +20,18 @@ extern "C"
 struct coroutine;
 
 struct schedule {
-	char stack[STACK_SIZE];
+	char stack[STACK_SIZE]; // 保存当前运行coroutine的栈
 	ucontext_t main;
 	int nco;
 	int cap;
 	int running;
 	struct coroutine **co;
     int last_co_id;
+    int last_check_idx;
 };
 
 struct coroutine {
-	coroutine_func func;
-    coroutine_func on_delete;
-    coroutine_timeout_func on_timeout;
-	void *ud;
+	struct coroutine_callbacks_t callbacks;
 	ucontext_t ctx;
 	struct schedule * sch;
 	ptrdiff_t cap;
@@ -41,21 +39,22 @@ struct coroutine {
 	int status;
 	char *stack;
     time_t create_time;
+    int fatal;
 };
 
+int coroutine_delete( struct schedule * sched, int id );
+
 struct coroutine * 
-_co_new(struct schedule *S , coroutine_func func, coroutine_func on_delete, coroutine_timeout_func on_timeout, void *ud) {
+_co_new(struct schedule *sched, struct coroutine_callbacks_t callbacks) {
 	struct coroutine * co = malloc(sizeof(*co));
-	co->func = func;
-    co->on_delete = on_delete;
-    co->on_timeout = on_timeout;
-	co->ud = ud;
-	co->sch = S;
+	co->callbacks = callbacks;
+	co->sch = sched;
 	co->cap = 0;
 	co->size = 0;
 	co->status = COROUTINE_READY;
 	co->stack = NULL;
     co->create_time = time(NULL);
+    co->fatal = 0;
 	return co;
 }
 
@@ -67,56 +66,56 @@ _co_delete(struct coroutine *co) {
 
 struct schedule * 
 coroutine_open(void) {
-	struct schedule *S = malloc(sizeof(*S));
-	S->nco = 0;
-	S->cap = DEFAULT_COROUTINE;
-	S->running = -1;
-	S->co = malloc(sizeof(struct coroutine *) * S->cap);
-    S->last_co_id = -1;
-	memset(S->co, 0, sizeof(struct coroutine *) * S->cap);
-	return S;
+	struct schedule *sched = malloc(sizeof(*sched));
+	sched->nco = 0;
+	sched->cap = DEFAULT_COROUTINE;
+	sched->running = -1;
+	sched->co = malloc(sizeof(struct coroutine *) * sched->cap);
+    sched->last_co_id = -1;
+    sched->last_check_idx = 0;
+	memset(sched->co, 0, sizeof(struct coroutine *) * sched->cap);
+	return sched;
 }
-
+// coroutine_close的时候是强制关闭的，可能部分coroutine还未执行完
 void 
-coroutine_close(struct schedule *S) {
+coroutine_close(struct schedule *sched) {
 	int i;
-	for (i=0;i<S->cap;i++) {
-		struct coroutine * co = S->co[i];
+	for (i=0;i<sched->cap;i++) {
+		struct coroutine * co = sched->co[i];
 		if (co) {
 			_co_delete(co);
 		}
 	}
-	free(S->co);
-	S->co = NULL;
-	free(S);
+	free(sched->co);
+	sched->co = NULL;
+	free(sched);
 }
 
 int 
-coroutine_new(struct schedule *S, coroutine_func func, coroutine_func on_delete, coroutine_timeout_func on_timeout, void *ud) {
-    if (S->nco >= S->cap && S->cap >= MAX_COROUTINE) {
+coroutine_new(struct schedule *sched, struct coroutine_callbacks_t callbacks) {
+    if (sched->nco >= sched->cap && sched->cap >= MAX_COROUTINE) {
         // full
         return -1;
     }
     
-	struct coroutine *co = _co_new(S, func, on_delete, on_timeout, ud);
-	if (S->nco >= S->cap) {
-		int id = S->cap;
-		S->cap *= 2;
-		S->co = realloc(S->co, S->cap * 2 * sizeof(struct coroutine *));
-		memset(S->co + S->cap , 0 , sizeof(struct coroutine *) * S->cap);
-		S->co[S->cap] = co;
-		S->cap *= 2;
-		++S->nco;
-        S->last_co_id = id;
+	struct coroutine *co = _co_new(sched, callbacks);
+	if (sched->nco >= sched->cap) {
+		int id = sched->cap;
+		sched->co = realloc(sched->co, sched->cap * 2 * sizeof(struct coroutine *));
+		memset(sched->co + sched->cap , 0 , sizeof(struct coroutine *) * sched->cap);
+		sched->co[sched->cap] = co;
+		sched->cap *= 2;
+		++sched->nco;
+        sched->last_co_id = id;
 		return id;
 	} else {
 		int i;
-		for (i=0;i<S->cap;i++) {
-            int id = (i + 1 + S->last_co_id) % S->cap;
-			if (S->co[id] == NULL) {
-				S->co[id] = co;
-				++S->nco;
-                S->last_co_id = id;
+		for (i=0;i<sched->cap;i++) {
+            int id = (i + 1 + sched->last_co_id) % sched->cap;
+			if (sched->co[id] == NULL) {
+				sched->co[id] = co;
+				++sched->nco;
+                sched->last_co_id = id;
 				return id;
 			}
 		}
@@ -128,39 +127,39 @@ coroutine_new(struct schedule *S, coroutine_func func, coroutine_func on_delete,
 static void
 mainfunc(uint32_t low32, uint32_t hi32) {
 	uintptr_t ptr = (uintptr_t)low32 | ((uintptr_t)hi32 << 32);
-	struct schedule *S = (struct schedule *)ptr;
-	int id = S->running;
-    struct coroutine *C = S->co[id];
-    C->func(S,C->ud);
-    coroutine_delete(S, id);
-	S->running = -1;
+	struct schedule *sched = (struct schedule *)ptr;
+	int id = sched->running;
+    struct coroutine *C = sched->co[id];
+    C->callbacks.main_(sched,C->callbacks.ud_);
+    coroutine_delete(sched, id);
+	sched->running = -1;
 }
 
 void 
-coroutine_resume(struct schedule * S, int id) {
-	assert(S->running == -1);
-	assert(id >=0 && id < S->cap);
-	struct coroutine *C = S->co[id];
+coroutine_resume(struct schedule * sched, int id) {
+	assert(sched->running == -1);
+	assert(id >=0 && id < sched->cap);
+	struct coroutine *C = sched->co[id];
 	if (C == NULL)
 		return;
 	int status = C->status;
 	switch(status) {
 	case COROUTINE_READY:
 		getcontext(&C->ctx);
-		C->ctx.uc_stack.ss_sp = S->stack;
+		C->ctx.uc_stack.ss_sp = sched->stack;
 		C->ctx.uc_stack.ss_size = STACK_SIZE;
-		C->ctx.uc_link = &S->main;
-		S->running = id;
+		C->ctx.uc_link = &sched->main;
+		sched->running = id;
 		C->status = COROUTINE_RUNNING;
-		uintptr_t ptr = (uintptr_t)S;
+		uintptr_t ptr = (uintptr_t)sched;
 		makecontext(&C->ctx, (void (*)(void)) mainfunc, 2, (uint32_t)ptr, (uint32_t)(ptr>>32));
-		swapcontext(&S->main, &C->ctx);
+		swapcontext(&sched->main, &C->ctx);
 		break;
 	case COROUTINE_SUSPEND:
-		memcpy(S->stack + STACK_SIZE - C->size, C->stack, C->size);
-		S->running = id;
+		memcpy(sched->stack + STACK_SIZE - C->size, C->stack, C->size);
+		sched->running = id;
 		C->status = COROUTINE_RUNNING;
-		swapcontext(&S->main, &C->ctx);
+		swapcontext(&sched->main, &C->ctx);
 		break;
 	default:
 		assert(0);
@@ -174,88 +173,131 @@ _save_stack(struct coroutine *C, char *top) {
 	if (C->cap < top - &dummy) {
 		free(C->stack);
 		C->cap = top-&dummy;
-		C->stack = malloc(C->cap);
+		C->stack = malloc(C->cap);  // 创建栈空间
 	}
 	C->size = top - &dummy;
-	memcpy(C->stack, &dummy, C->size);
+	memcpy(C->stack, &dummy, C->size);  // 保存
 }
 
 void
-coroutine_yield(struct schedule * S) {
-	int id = S->running;
+coroutine_yield(struct schedule * sched) {
+	int id = sched->running;
 	assert(id >= 0);
-	struct coroutine * C = S->co[id];
-	assert((char *)&C > S->stack);
-	_save_stack(C,S->stack + STACK_SIZE);
+	struct coroutine * C = sched->co[id];
+	assert((char *)&C > sched->stack);
+	_save_stack(C,sched->stack + STACK_SIZE);
 	C->status = COROUTINE_SUSPEND;
-	S->running = -1;
-	swapcontext(&C->ctx , &S->main);
+	sched->running = -1;
+	swapcontext(&C->ctx , &sched->main);
+    // 这里resume/delete的时候一定要把原来的函数context执行完，不然函数里声明类的析构函数不会被执行！
 }
 
 int 
-coroutine_status(struct schedule * S, int id) {
-	assert(id>=0 && id < S->cap);
-	if (S->co[id] == NULL) {
+coroutine_status(struct schedule * sched, int id) {
+	assert(id>=0 && id < sched->cap);
+	if (sched->co[id] == NULL) {
 		return COROUTINE_DEAD;
 	}
-	return S->co[id]->status;
+	return sched->co[id]->status;
 }
 
 int 
-coroutine_running(struct schedule * S) {
-	return S->running;
+coroutine_running(struct schedule * sched) {
+	return sched->running;
 }
 
-int coroutine_delete( struct schedule * S, int id ) {
-    assert(id>=0 && id < S->cap);
-    struct coroutine *C = S->co[id];
+int coroutine_delete( struct schedule * sched, int id ) {
+    assert(id>=0 && id < sched->cap);
+    struct coroutine *C = sched->co[id];
     if (NULL == C) {
         return -1;
     }
     
-    C->on_delete(S, C->ud);
+    C->callbacks.ondelete_(sched, C->callbacks.ud_);
     _co_delete(C);
-    S->co[id] = NULL;
-    --S->nco;
+    sched->co[id] = NULL;
+    --sched->nco;
     return 0;
 }
 
-int coroutine_check_timeout( struct schedule * S, int life ) {
+int coroutine_check_timeout( struct schedule * sched, int max_check_num, int life ) {
     int del_num = 0;
     time_t now = time(NULL);
-    int i;
-    for (i = 0; i < S->cap; ++i) {
-        struct coroutine * C = S->co[i];
+    int check_num = 0;
+    int i = -1;
+
+    while (check_num < max_check_num && check_num <= sched->cap) {
+        ++check_num;
+        i = sched->last_check_idx;
+        i = (i >= sched->cap || i < 0)? 0: i;
+        sched->last_check_idx = i + 1;
+        
+        struct coroutine * C = sched->co[i];
         if (NULL == C) {
             continue;
         }
-        
+
         if (now - C->create_time >= life) {
-            C->on_timeout(S, i, C->ud);
-            coroutine_delete(S, i);
+            C->callbacks.ontimeout_(sched, i, C->callbacks.ud_);
+            C->fatal = 1;
+            // 让他执行完, coroutine要检查fatal字段
+            coroutine_resume(sched, i);
             ++del_num;
         }
     }
-
+    
     return del_num;
     
 }
 
-int coroutine_id( struct schedule * S )
-{
-    return S->running;
+int coroutine_id( struct schedule * sched ) {
+    return sched->running;
 }
 
-void* coroutine_get_ud( struct schedule * S, int id ) {
-    assert(id>=0 && id < S->cap);
-    struct coroutine *C = S->co[id];
+void* coroutine_get_ud( struct schedule * sched, int id ) {
+    assert(id>=0 && id < sched->cap);
+    struct coroutine *C = sched->co[id];
     if (NULL == C) {
         return NULL;
     }
 
-    return C->ud;
+    return C->callbacks.ud_;
 }
+
+int coroutine_check( struct schedule * sched, int id ) {
+    if (id < 0 || id >= sched->cap) {
+        return -1;
+    }
+
+    struct coroutine *C = sched->co[id];
+    if (NULL == C) {
+        return -1;
+    }
+
+    return 0;
+}
+
+int coroutine_fatal( struct schedule * sched, int id ) {
+    assert(id>=0 && id < sched->cap);
+    struct coroutine *C = sched->co[id];
+    if (NULL == C) {
+        return 0;
+    }
+
+    return C->fatal;
+}
+
+
+int coroutine_get_sched_cap( struct schedule * sched ) {
+    return sched->cap;
+}
+
+int coroutine_get_sched_cur( struct schedule * sched ) {
+    return sched->nco;
+}
+
 
 #ifdef __cplusplus
 }
+
 #endif
